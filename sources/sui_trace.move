@@ -2,11 +2,10 @@ module sui_trace::sui_trace {
     use std::string::String;
 
     use sui::table::{Self, Table};
+    use sui::coin::value;
     use sui::balance::Balance;
-    use sui::balance::value;
-    use sui::coin;
-    use sui::sui::SUI;
     use sui::url::{Self, Url};
+    use sui::sui::SUI;
     use sui::kiosk::{Self, Kiosk, KioskOwnerCap}; // Import Kiosk types and functions
 
     // --- Events ---
@@ -77,7 +76,8 @@ module sui_trace::sui_trace {
         
         // Flags for potential tampering or issues.
         // Maps the address of the entity who flagged it to a reason.
-        flags: Table<address, String>, 
+        flags: Table<address, String>,
+        flaggers: vector<address>, // List of addresses that have flagged this batch 
         is_tampered: bool, // Derived state: true if 'flags' table is not empty
 
         // Immutable chronological log of all significant events.
@@ -102,18 +102,53 @@ module sui_trace::sui_trace {
     /// This object is shared and holds the payment in escrow.
     public struct Order has key, store {
         id: UID,
-        product_listing_id: ID, // Reference to the ProductListing
-        product_batch_id: ID,   // Reference to the ProductBatch
+        product_listing_id: UID,
+        product_batch_id: UID,
         buyer: address,
         seller: address,
         amount: u64,
-        payment_escrow: Balance<SUI>, // Payment held in escrow
-        pickup_code: String,    // Unique ID for pickup/delivery verification
+        payment_escrow: Balance<SUI>,
+        pickup_code: String,
         order_state: u8,
         problem_reported: bool,
         problem_details: String,
         created_at: u64,
     }
+
+    public entry fun create_order(
+    listing: ProductListing,
+    payment: u64, // Must be at least equal to listing.price
+    pickup_code: vector<u8>, // Could be random bytes or user-defined
+    ctx: &mut TxContext,
+    ){
+        let buyer = tx_context::sender(ctx);
+        assert!(listing.price <= sui::coin::value(&payment), E_INSUFFICIENT_PAYMENT); // Ensure enough payment
+
+        let current_time = tx_context::epoch_timestamp_ms(ctx);
+
+        // Create Order object
+        let order = Order {
+            id: object::new(ctx),
+            product_listing_id: listing.id,
+            product_batch_id: listing.product_batch_id,
+            buyer,
+            seller: listing.seller,
+            amount: listing.price,
+            payment_escrow: sui::balance::value<SUI>, // Put entire Coin into escrow for now
+            pickup_code: String::utf8(pickup_code),
+            order_state: ORDER_STATE_PENDING, // e.g., 0 = Pending
+            problem_reported: false,
+            problem_details: b"".to_string(),
+            created_at: current_time,
+        };
+
+        // Store the order in the sender's account
+        transfer::transfer(order, buyer);
+
+        // You can burn or delete the ProductListing here if you want to make it unlistable
+        // object::delete(listing); // optional
+        }
+
 
     // --- Error Codes ---
     const E_NOT_OWNER: u64 = 0;
@@ -134,6 +169,8 @@ module sui_trace::sui_trace {
     const E_NOT_SELLER: u64 = 15;
     const E_BATCH_IS_TAMPERED: u64 = 16;
     const E_BATCH_NOT_LISTED_FOR_SALE: u64 = 17;
+    const E_INSUFFICIENT_PAYMENT: u64 = 18;
+    const E_ORDER_ALREADY_CLOSED: u64 = 19;
 
 
     // --- Public Functions (Entry Points) ---
@@ -148,8 +185,8 @@ module sui_trace::sui_trace {
         let sender = tx_context::sender(ctx);
         let current_timestamp = sui::tx_context::epoch_timestamp_ms(ctx); // Use epoch_timestamp_ms
 
-        let batch_id = b"batch_id_bytes".to_string();
-        let initial_location = b"initial_location_bytes".to_string();
+        let batch_id = String::utf8(b"batch_id_bytes");
+        let initial_location = String::utf8(b"initial_location_bytes");
 
         // Create the initial event log
         let mut history = vector::empty<ProductEvent>();
@@ -171,6 +208,7 @@ module sui_trace::sui_trace {
             current_location: initial_location,
             current_stage: STAGE_HARVESTED,
             flags: table::new(ctx),
+            flaggers: vector::empty<address>(), // Initialize empty vector for flaggers
             is_tampered: false,
             history,
             created_at: current_timestamp,
@@ -194,7 +232,7 @@ module sui_trace::sui_trace {
         assert!(product_batch.current_stage != STAGE_SOLD, E_BATCH_ALREADY_SOLD); // Cannot transfer if sold
 
         let current_timestamp = sui::tx_context::epoch_timestamp_ms(ctx);
-        let new_location = b"new_location_bytes".to_string();
+        let new_location = String::utf8(b"new_location_bytes");
 
         // Update ownership and location
         product_batch.current_owner = new_owner;
@@ -213,33 +251,33 @@ module sui_trace::sui_trace {
         );
     }
 
-    /// Logs a processing event for the ProductBatch.
-    /// Only the current owner can log processing. Updates stage to 'Processed'.
-            public entry fun log_processing(
-                product_batch: &mut ProductBatch,
-                _details_bytes: vector<u8>,
-                ctx: &mut TxContext,
-            ) {
-                let sender = tx_context::sender(ctx);
-                assert!(sender == product_batch.current_owner, E_NOT_OWNER);
-                assert!(!product_batch.is_tampered, E_BATCH_ALREADY_TAMPERED);
-                assert!(product_batch.current_stage != STAGE_SOLD, E_BATCH_ALREADY_SOLD);
+/// Logs a processing event for the ProductBatch.
+/// Only the current owner can log processing. Updates stage to 'Processed'.
+    public entry fun log_processing(
+        product_batch: &mut ProductBatch,
+        _details_bytes: vector<u8>,
+        ctx: &mut TxContext,
+    ) {
+        let sender = tx_context::sender(ctx);
+        assert!(sender == product_batch.current_owner, E_NOT_OWNER);
+        assert!(!product_batch.is_tampered, E_BATCH_ALREADY_TAMPERED);
+        assert!(product_batch.current_stage != STAGE_SOLD, E_BATCH_ALREADY_SOLD);
 
-                let current_timestamp = sui::tx_context::epoch_timestamp_ms(ctx);
-                let details = b"details_bytes".to_string();
-                assert!(!std::string::is_empty(&details), E_INVALID_DETAILS);
+        let current_timestamp = sui::tx_context::epoch_timestamp_ms(ctx);
+        let details = String::utf8(b"details_bytes");
+        assert!(!std::string::is_empty(&details), E_INVALID_DETAILS);
 
-                product_batch.current_stage = STAGE_PROCESSED; // Update stage
-                vector::push_back(
-                    &mut product_batch.history,
-                    ProductEvent {
-                        event_type: EVENT_PROCESSED,
-                        actor: sender,
-                        timestamp: current_timestamp,
-                        details,
-                    }
-                );
+        product_batch.current_stage = STAGE_PROCESSED; // Update stage
+        vector::push_back(
+            &mut product_batch.history,
+            ProductEvent {
+                event_type: EVENT_PROCESSED,
+                actor: sender,
+                timestamp: current_timestamp,
+                details,
             }
+        );
+    }
 
     /// Logs an inspection event for the ProductBatch.
     /// Only the current owner can log inspection. Updates stage to 'Inspected'.
@@ -254,7 +292,7 @@ module sui_trace::sui_trace {
         assert!(product_batch.current_stage != STAGE_SOLD, E_BATCH_ALREADY_SOLD);
 
         let current_timestamp = sui::tx_context::epoch_timestamp_ms(ctx);
-        let details = b"details_bytes".to_string();
+        let details = String::utf8(b"details_bytes");
         assert!(!std::string::is_empty(&details), E_INVALID_DETAILS);
 
         product_batch.current_stage = STAGE_INSPECTED; // Update stage
@@ -281,7 +319,7 @@ module sui_trace::sui_trace {
         assert!(product_batch.current_stage != STAGE_SOLD, E_BATCH_ALREADY_SOLD);
 
         let current_timestamp = sui::tx_context::epoch_timestamp_ms(ctx);
-        let reason = b"reason_bytes".to_string();
+        let reason = String::utf8(b"reason_bytes");
         assert!(!std::string::is_empty(&reason), E_INVALID_DETAILS);
 
         // Add a flag and mark as tampered
@@ -313,7 +351,7 @@ module sui_trace::sui_trace {
         assert!(!table::contains(&product_batch.flags, sender), E_BATCH_ALREADY_FLAGGED_BY_SENDER);
 
         let current_timestamp = sui::tx_context::epoch_timestamp_ms(ctx);
-        let reason = b"reason_bytes".to_string();
+        let reason = String::utf8(b"reason_bytes");
         assert!(!std::string::is_empty(&reason), E_INVALID_DETAILS);
 
         table::add(&mut product_batch.flags, sender, reason);
@@ -375,50 +413,61 @@ module sui_trace::sui_trace {
     /// The ProductBatch must be owned by the seller (sender).
     /// The seller must provide their Kiosk and KioskOwnerCap.
     public entry fun create_and_list_product(
-        kiosk: &mut Kiosk, // Kiosk object to place the listing in
-        kiosk_cap: &KioskOwnerCap, // Capability to prove ownership of the Kiosk
-        product_batch: ProductBatch, // Takes ownership of the ProductBatch
-        price: u64,
-        _title_bytes: vector<u8>,
-        _description_bytes: vector<u8>,
-        image_url_bytes: vector<u8>,
-        ctx: &mut TxContext,
+    _kiosk: &mut Kiosk,               // Kiosk to list the product
+    _kiosk_cap: &KioskOwnerCap,       // Capability for Kiosk
+    mut batch_id: ProductBatch,       // Product batch to be listed
+    _price: u64,
+    _title_bytes: vector<u8>,
+    _description_bytes: vector<u8>,
+    _image_url_bytes: vector<u8>,
+    ctx: &mut TxContext,
     ) {
         let sender = tx_context::sender(ctx);
-        assert!(sender == product_batch.current_owner, E_NOT_OWNER); // Only owner can list their batch
-        assert!(!product_batch.is_tampered, E_BATCH_IS_TAMPERED); // Cannot list tampered product
-        assert!(product_batch.current_stage == STAGE_HARVESTED || product_batch.current_stage == STAGE_PROCESSED || product_batch.current_stage == STAGE_INSPECTED, E_BATCH_NOT_LISTED_FOR_SALE); // Must be in a ready-for-sale stage
 
+        // === VALIDATIONS ===
+        assert!(sender == batch_id.current_owner, E_NOT_OWNER);
+        assert!(!batch_id.is_tampered, E_BATCH_IS_TAMPERED);
+        assert!(
+            batch_id.current_stage == STAGE_HARVESTED ||
+            batch_id.current_stage == STAGE_PROCESSED ||
+            batch_id.current_stage == STAGE_INSPECTED,
+            E_BATCH_NOT_LISTED_FOR_SALE
+        );
+
+        // === STATE UPDATES ===
         let current_timestamp = sui::tx_context::epoch_timestamp_ms(ctx);
+        batch_id.current_stage = STAGE_DELIVERED;
 
-        // Update product batch stage to "Listed" (conceptually represented by STAGE_SOLD or a new LISTED stage)
-        // For simplicity, we use STAGE_DELIVERED to indicate it's ready for marketplace.
-        product_batch.current_stage = STAGE_DELIVERED;
         vector::push_back(
-            &mut product_batch.history,
+            &mut batch_id.history,
             ProductEvent {
                 event_type: EVENT_LISTED,
                 actor: sender,
                 timestamp: current_timestamp,
-                details: b"Product batch listed for sale".to_string(),
+                details: String::utf8(b"Product batch listed for sale") // FIX: `.to_string()`
             }
         );
-        transfer::share_object(product_batch); // Share the batch so it can be viewed by anyone
 
+        // === SHARE BATCH OBJECT ===
+        let batch_id_val = object::id(&batch_id); // FIXED: declared `batch_id_val`
+        transfer::public_share_object(batch_id);  // Makes the object public so others can access it
+
+        // === CREATE LISTING ===
         let listing = ProductListing {
             id: object::new(ctx),
-            product_batch_id: object::id(&product_batch),
+            product_batch_id: batch_id_val,
             seller: sender,
-            price,
-            title: _title_bytes.to_string(), // Convert bytes to String
-            description: _description_bytes.to_string(), // Convert bytes to String
-            image_url: url::new_unsafe_from_bytes(image_url_bytes),
+            price: _price, // FIXED: use `_price`, not `price`
+            title: std::string::utf8(_title_bytes), // already vector<u8>
+            description: std::string::utf8(_description_bytes),
+            image_url: url::new_unsafe_from_bytes(_image_url_bytes),
             listed_at: current_timestamp,
         };
 
-        // Place the ProductListing into the Kiosk
-        kiosk::place(kiosk, kiosk_cap, listing);
+        // === PLACE IN KIOSK ===
+        kiosk::place(_kiosk, _kiosk_cap, listing);
     }
+
 
     /// Buyer places an order for a ProductListing from a Kiosk.
     /// This function moves the payment to escrow, creates an Order object,
@@ -427,7 +476,7 @@ module sui_trace::sui_trace {
         kiosk: &mut Kiosk,
         kiosk_cap: &KioskOwnerCap, // Buyer provides the KioskOwnerCap of the seller's Kiosk to take the item
         listing_id: ID, // ID of the ProductListing in the Kiosk
-        payment: Balance<sui::sui::SUI>,
+        payment: Balance<SUI>,
         ctx: &mut TxContext,
     ) {
         let sender = tx_context::sender(ctx);
@@ -437,16 +486,17 @@ module sui_trace::sui_trace {
         // kiosk::take returns the owned object.
         let listing: ProductListing = kiosk::take(kiosk, kiosk_cap, listing_id);
 
-        let _amount = value(&payment) >= listing.price;
+        let payment_value: u64 = value(&payment);
+        assert!(payment_value >= listing.price, E_INSUFFICIENT_PAYMENT);
         assert!(sender == tx_context::sender(ctx), E_NOT_BUYER); // Ensure sender is the buyer
 
         // Generate a simple, unique pickup code.
         // This code's confidentiality is handled off-chain.
-        let pickup_code = b"pickup".to_string(); // Use current timestamp as a unique code
+        let pickup_code = std::string::utf8(b"current_timestamp"); // Use current timestamp as a unique code
 
         let order = Order {
             id: object::new(ctx),
-            product_listing_id: object::id(&listing),
+            product_listing_id: object::id<ProductListing>(&listing),
             product_batch_id: listing.product_batch_id,
             buyer: sender,
             seller: listing.seller,
@@ -455,7 +505,7 @@ module sui_trace::sui_trace {
             pickup_code: pickup_code,
             order_state: ORDER_STATE_PAID_ESCROW,
             problem_reported: false,
-            problem_details: b"".to_string(), // Initially no problem reported
+            problem_details: String::utf8(b""), // Initially no problem reported
             created_at: current_timestamp,
         };
 
@@ -463,16 +513,24 @@ module sui_trace::sui_trace {
         // it's now encapsulated by the Order lifecycle.
         transfer::transfer(listing, order.seller); // Seller gets the listing NFT for their records
 
+        // Extract fields BEFORE sharing/moving order
+        let order_id = object::id(&order);
+        let product_batch_id = order.product_batch_id;
+        let buyer = order.buyer;
+        let seller = order.seller;
+        let amount = order.amount;
+        let pickup_code = order.pickup_code;
+
         // Share the Order object for both buyer and seller to interact with
-        transfer::share_object(order);
+        transfer::public_share_object(order);
 
         // Emit an event containing the pickup code for off-chain listeners (Walrus)
         sui::event::emit(OrderPlacedEvent {
-            order_id: object::id(&order),
-            product_batch_id: order.product_batch_id,
-            buyer: order.buyer,
-            seller: order.seller,
-            amount: order.amount,
+            order_id,
+            product_batch_id,
+            buyer,
+            seller,
+            amount,
             pickup_code, // Emit the pickup code here
         });
     }
@@ -488,14 +546,14 @@ module sui_trace::sui_trace {
         let sender = tx_context::sender(ctx);
         assert!(sender == product_batch.current_owner, E_NOT_OWNER); // Sender must be current batch owner (seller)
         assert!(sender == order.seller, E_NOT_SELLER); // Sender must be the seller of the order
-        assert!(object::id(product_batch) == order.product_batch_id, E_INVALID_DETAILS); // Ensure batch matches order
+        assert!(object::id(product_batch) == &order.product_batch_id, E_INVALID_DETAILS); // Ensure batch matches order
 
         assert!(!product_batch.is_tampered, E_BATCH_IS_TAMPERED);
         assert!(product_batch.current_stage != STAGE_SOLD, E_BATCH_ALREADY_SOLD);
         assert!(order.order_state == ORDER_STATE_PAID_ESCROW, E_ORDER_STATE_INVALID); // Order must be in escrow
 
         let current_timestamp = sui::tx_context::epoch_timestamp_ms(ctx);
-        let new_location = new_location_bytes.to_string();
+        let new_location = string::utf8(new_location_bytes);
         assert!(!std::string::is_empty(&new_location), E_INVALID_DETAILS);
 
         product_batch.current_location = new_location;
@@ -507,7 +565,7 @@ module sui_trace::sui_trace {
                 event_type: EVENT_TRANSFERRED,
                 actor: sender,
                 timestamp: current_timestamp,
-                details: b"Product batch sent for delivery".to_string(),
+                details: String::utf8(b"Product batch sent for delivery"),
             }
         );
 
@@ -525,19 +583,17 @@ module sui_trace::sui_trace {
     ) {
         let sender = tx_context::sender(ctx);
         assert!(sender == order.buyer, E_NOT_BUYER);
-        assert!(object::id(product_batch) == order.product_batch_id, E_INVALID_DETAILS); // Ensure batch matches order
+        assert!(object::id(product_batch) == &order.product_batch_id, E_INVALID_DETAILS); // Ensure batch matches order
 
         assert!(order.order_state == ORDER_STATE_IN_TRANSIT || order.order_state == ORDER_STATE_PAID_ESCROW, E_ORDER_STATE_INVALID);
         assert!(!order.problem_reported, E_PROBLEM_ALREADY_REPORTED);
         assert!(product_batch.current_owner == order.seller, E_NOT_OWNER); // Ensure seller still owns the batch (before transfer)
 
-        let _provided_pickup_code = _provided_pickup_code_bytes.to_string();
+        let _provided_pickup_code = string::utf8(_provided_pickup_code_bytes);
         assert!(&_provided_pickup_code == &order.pickup_code, E_INVALID_PICKUP_CODE);
 
         let current_timestamp = sui::tx_context::epoch_timestamp_ms(ctx);
 
-        // Release payment to seller
-        transfer::public_transfer(order.payment_escrow, order.seller);
 
         // Transfer product batch ownership to buyer
         product_batch.current_owner = sender;
@@ -554,7 +610,7 @@ module sui_trace::sui_trace {
                 event_type: EVENT_DELIVERY_CONFIRMED,
                 actor: sender,
                 timestamp: current_timestamp,
-                details: b"Delivery confirmed by buyer, payment released.".to_string(),
+                details: string::utf8(b"Delivery confirmed by buyer, payment released."),
             }
         );
         vector::push_back(
@@ -563,9 +619,48 @@ module sui_trace::sui_trace {
                 event_type: EVENT_SOLD,
                 actor: sender,
                 timestamp: current_timestamp,
-                details: b"Product batch sold and ownership transferred to buyer.".to_string(),
+                details: string::utf8(b"Product batch sold and ownership transferred to buyer."),
             }
         );
+    }
+
+
+    public entry fun release_payment(order: &mut Order) {
+        // Reentrancy guard
+        assert!(!order.is_closed, E_ORDER_ALREADY_CLOSED); // You'll need to define this error
+
+        order.is_closed = true; // Mark as closed immediately
+
+        // Move the Coin out of the struct
+        let payment = order.payment_escrow;
+        order.payment_escrow = coin::zero<SUI>(); // Optional safety: remove from order
+
+        // Transfer ownership of the Coin to the seller
+        transfer::public_transfer(payment, order.seller);
+    }
+
+    public entry fun destroy_order(order: Order) {
+
+        // Directly deconstruct, now that we own it
+        let Order {
+            id: _,
+            product_listing_id: _,
+            product_batch_id: _,
+            buyer: _,
+            seller: _,
+            amount: _,
+            payment_escrow: _,
+            pickup_code: _,
+            order_state: _,
+            problem_reported: _,
+            problem_details: _,
+            created_at: _,
+            is_closed: _, // <== NEW FIELD
+        } = order;
+
+        coin::destroy_zero(payment_escrow); // Clean up coin if zeroed
+        // Optionally: delete or persist order object
+        object::delete(id); // if you want to clean up
     }
 
     /// Buyer cancels an order before delivery confirmation (or problem resolution).
@@ -581,8 +676,23 @@ module sui_trace::sui_trace {
 
         let _current_timestamp = sui::tx_context::epoch_timestamp_ms(ctx);
 
+        let Order {
+            id: _,
+            product_listing_id: _,
+            product_batch_id: _,
+            payment_escrow,
+            buyer,
+            seller: _,
+            created_at: _,
+            amount: _,
+            order_state: _,
+            pickup_code: _,
+            problem_reported: _,
+            problem_details: _
+        } = order;
+
         // Refund payment to buyer
-        transfer::public_transfer(order.payment_escrow, order.buyer);
+        transfer::public_transfer(payment_escrow, buyer);
 
         // Update order state
         order.order_state = ORDER_STATE_CANCELLED;
@@ -591,7 +701,7 @@ module sui_trace::sui_trace {
         // For simplicity, we assume off-chain indexing can handle this.
     }
 
-    /// Buyer reports a problem with the product.
+    // Buyer reports a problem with the product.
     public entry fun report_problem(
         order: &mut Order,
         _problem_details_bytes: vector<u8>,
@@ -603,17 +713,23 @@ module sui_trace::sui_trace {
         assert!(!order.problem_reported, E_PROBLEM_ALREADY_REPORTED);
 
         let _current_timestamp = sui::tx_context::epoch_timestamp_ms(ctx);
-        let problem_details = _problem_details_bytes.to_string();
-        assert!(problem_details, E_INVALID_DETAILS);
+        let problem_details = String::utf8(_problem_details_bytes);
+        assert!(!std::string::is_empty(&problem_details), E_INVALID_DETAILS);
 
         order.problem_reported = true;
         order.problem_details = problem_details;
         order.order_state = ORDER_STATE_PROBLEM;
 
         // Log event
+        sui::event::emit(OrderProblemReportedEvent {
+            order_id: object::id(order),
+            buyer: order.buyer,
+            problem_details: order.problem_details,
+        });
+
     }
 
-    /// Seller or Farmer resolves a reported problem.
+    // Seller or Farmer resolves a reported problem.
     public entry fun resolve_problem(
         order: &mut Order,
         product_batch: &mut ProductBatch, // Need batch to potentially clear its flags
@@ -628,7 +744,7 @@ module sui_trace::sui_trace {
 
         let _current_timestamp = sui::tx_context::epoch_timestamp_ms(ctx);
         let _resolution_details = _resolution_details_bytes.to_string();
-        assert!(_resolution_details, E_INVALID_DETAILS);
+        assert!(!std::string::is_empty(&_resolution_details), E_INVALID_DETAILS);
 
         order.problem_reported = false;
         order.problem_details = b"".to_string(); // Clear problem details
@@ -673,17 +789,17 @@ module sui_trace::sui_trace {
 
     // Gets all active flags for a ProductBatch.
     public fun get_batch_flags(product_batch: &ProductBatch): vector<FlagEntry> {
-        let flag_entries = vector::empty<FlagEntry>();
-        let flagger_addresses = table::keys(&product_batch.flags);
+        let flagger_addresses = &product_batch.flaggers;
+        let mut flag_entries = vector::empty<FlagEntry>();
 
-        let len = vector::length(&flagger_addresses);
+        let len = vector::length(flagger_addresses);
         let mut i = 0;
         while (i < len) {
-            let flagger = *vector::borrow(&flagger_addresses, i);
+            let flagger = *vector::borrow(flagger_addresses, i);
             let reason = table::borrow(&product_batch.flags, flagger);
             vector::push_back(&mut flag_entries, FlagEntry { flagger, reason: *reason });
             i = i + 1;
-        }
+        };
         flag_entries
     }
 
@@ -737,7 +853,7 @@ module sui_trace::sui_trace {
                 event_type: EVENT_SOLD,
                 actor: sender,
                 timestamp: current_timestamp,
-                details: b"Product batch sold to end consumer".to_string(),
+                details: String::utf8(b"Product batch sold to end consumer"),
             }
         );
     }
@@ -749,18 +865,6 @@ module sui_trace::sui_trace {
         product_batch.history
     }
 
-    // Gets the current status and ownership details of a ProductBatch.
-    public fun get_status(product_batch: &ProductBatch): (address, address, address, String, u8, bool) {
-        (
-            product_batch.id.to_address(),
-            product_batch.origin_farmer,
-            product_batch.current_owner,
-            product_batch.current_location,
-            product_batch.current_stage,
-            product_batch.is_tampered
-        )
-    }
-
     // Gets all active flags for a ProductBatch.
     public fun get_flags(product_batch: &ProductBatch, flagger: address): &String {
         table::borrow(&product_batch.flags, flagger)
@@ -768,44 +872,44 @@ module sui_trace::sui_trace {
 
     // Translates a stage `u8` to a human-readable String.
     public fun get_stage_name(stage: u8): String {
-        if (stage == STAGE_HARVESTED) { return b"Harvested".to_string() };
-        if (stage == STAGE_IN_TRANSIT) { return b"In Transit".to_string() };
-        if (stage == STAGE_PROCESSED) { return b"Processed".to_string() };
-        if (stage == STAGE_INSPECTED) { return b"Inspected".to_string() };
-        if (stage == STAGE_DELIVERED) { return b"Delivered".to_string() };
-        if (stage == STAGE_SOLD) { return b"Sold".to_string() };
-        if (stage == STAGE_TAMPERED) { return b"Tampered".to_string() };
+        if (stage == STAGE_HARVESTED) { return String::utf8(b"Harvested")};
+        if (stage == STAGE_IN_TRANSIT) { return String::utf8(b"In Transit")};
+        if (stage == STAGE_PROCESSED) { return String::utf8(b"Processed")};
+        if (stage == STAGE_INSPECTED) { return String::utf8(b"Inspected")};
+        if (stage == STAGE_DELIVERED) { return String::utf8(b"Delivered")};
+        if (stage == STAGE_SOLD) { return String::utf8(b"Sold")};
+        if (stage == STAGE_TAMPERED) { return String::utf8(b"Tampered")};
         b"Unknown Stage".to_string() // Fallback for unexpected values
     }
 
     /// Translates an event type `u8` to a human-readable String.
     public fun get_event_type_name(event_type: u8): String {
-        if (event_type == EVENT_CREATED) { return b"Created".to_string()};
-        if (event_type == EVENT_TRANSFERRED) { return b"Transferred".to_string()};
-        if (event_type == EVENT_PROCESSED) { return b"Processed".to_string()};
-        if (event_type == EVENT_INSPECTED) { return b"Inspected".to_string()};
-        if (event_type == EVENT_DAMAGED) { return b"Damaged".to_string()};
-        if (event_type == EVENT_FLAGGED) { return b"Flagged".to_string()};
-        if (event_type == EVENT_FLAG_RESOLVED) { return b"Flag Resolved".to_string()};
-        if (event_type == EVENT_LISTED) { return b"Listed".to_string()};
-        if (event_type == EVENT_ORDERED) { return b"Ordered".to_string()};
-        if (event_type == EVENT_DELIVERY_CONFIRMED) { return b"Delivery Confirmed".to_string()};
-        if (event_type == EVENT_ORDER_CANCELLED) { return b"Order Cancelled".to_string()};
-        if (event_type == EVENT_PROBLEM_REPORTED) { return b"Problem Reported".to_string()};
-        if (event_type == EVENT_PROBLEM_RESOLVED) { return b"Problem Resolved".to_string()};
+        if (event_type == EVENT_CREATED) { return String::utf8(b"Created")};
+        if (event_type == EVENT_TRANSFERRED) { return String::utf8(b"Transferred")};
+        if (event_type == EVENT_PROCESSED) { return String::utf8(b"Processed")};
+        if (event_type == EVENT_INSPECTED) { return String::utf8(b"Inspected")};
+        if (event_type == EVENT_DAMAGED) { return String::utf8(b"Damaged")};
+        if (event_type == EVENT_FLAGGED) { return String::utf8(b"Flagged")};
+        if (event_type == EVENT_FLAG_RESOLVED) { return String::utf8(b"Flag Resolved")};
+        if (event_type == EVENT_LISTED) { return String::utf8(b"Listed")};
+        if (event_type == EVENT_ORDERED) { return String::utf8(b"Ordered")};
+        if (event_type == EVENT_DELIVERY_CONFIRMED) { return String::utf8(b"Delivery Confirmed")};
+        if (event_type == EVENT_ORDER_CANCELLED) { return String::utf8(b"Order Cancelled")};
+        if (event_type == EVENT_PROBLEM_REPORTED) { return String::utf8(b"Problem Reported")};
+        if (event_type == EVENT_PROBLEM_RESOLVED) { return String::utf8(b"Problem Resolved")};
         if (event_type == EVENT_SOLD) { return b"Sold".to_string() };
         b"Unknown Event Type".to_string() // Fallback
     }
 
     /// Translates an order state `u8` to a human-readable String.
     public fun get_order_state_name(state: u8): String {
-        if (state == ORDER_STATE_PENDING) { return b"Pending".to_string()};
-        if (state == ORDER_STATE_PAID_ESCROW) { return b"Paid - Escrow".to_string()};
-        if (state == ORDER_STATE_IN_TRANSIT) { return b"In Transit".to_string()};
-        if (state == ORDER_STATE_DELIVERED) { return b"Delivered (Awaiting Confirmation)".to_string()};
-        if (state == ORDER_STATE_CONFIRMED) { return b"Confirmed (Payment Released)".to_string()};
-        if (state == ORDER_STATE_CANCELLED) { return b"Cancelled".to_string()};
-        if (state == ORDER_STATE_PROBLEM) { return b"Problem Reported".to_string()};
+        if (state == ORDER_STATE_PENDING) { return String::utf8(b"Pending")};
+        if (state == ORDER_STATE_PAID_ESCROW) { return String::utf8(b"Paid - Escrow")};
+        if (state == ORDER_STATE_IN_TRANSIT) { return String::utf8(b"In Transit")};
+        if (state == ORDER_STATE_DELIVERED) { return String::utf8(b"Delivered (Awaiting Confirmation)")};
+        if (state == ORDER_STATE_CONFIRMED) { return String::utf8(b"Confirmed (Payment Released)")};
+        if (state == ORDER_STATE_CANCELLED) { return String::utf8(b"Cancelled")};
+        if (state == ORDER_STATE_PROBLEM) { return String::utf8(b"Problem Reported")};
         b"Unknown Order State".to_string() // Fallback for unexpected values
     }
 }
